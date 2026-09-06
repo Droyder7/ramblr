@@ -272,12 +272,17 @@ class RamblrImeService : InputMethodService() {
             recordHistory = ::recordImeHistory,
             runHistoryWrite = ImeHistoryWriteExecutor::execute,
             postToMain = { mainHandler.post(it) },
+            // #256: IME is a distinct OS registration from the accessibility service and gets its
+            // own on-demand exclusion read against the currently-bound editor's package -- no
+            // accessibility API involved, no polling.
+            isPackageExcluded = { pkg -> PerAppExclusionStore.isExcluded(this, pkg) },
+            isRecording = { runtime?.isRecording() ?: false },
         )
         // #233 Phase 1: the IME is the first (and only) host to reach the merged cloud-live seam.
         // CloudLiveWiring returns null unless the user opted in, chose cloud transcription, and
         // has a Gemini key -- so the default construction is byte-for-byte the previous behavior.
         // Accessibility stays final-only in this phase and is intentionally not wired.
-        createdRuntime = DictationRuntime(this, controller.listener, cloudLiveFactory = CloudLiveWiring.factoryOrNull(this))
+        createdRuntime = DictationRuntime(this, controller.listener, cloudLiveFactory = { CloudLiveWiring.factoryOrNull(this) })
         panelController = controller
         runtime = createdRuntime
         controller.onEditorChanged(editorGeneration, editorIdentity, currentInputConnection)

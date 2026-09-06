@@ -409,6 +409,19 @@ open class WhisperAccessibilityService : AccessibilityService() {
             maybeInjectPartial(text)
         }
 
+        // #245: route the Gemini Cloud Live interim through the exact same throttled,
+        // node-tracked direct-injection path local streaming preview already uses (#29),
+        // instead of leaving DictationRuntime's default no-op. This reuses -- rather than
+        // reimplements -- the field-verified safety properties that path already has: the
+        // recording-state guard, the shared streamingSession span tracking, and the
+        // onStreamingTeardown()/pendingStreamingHandoff reconciliation that resolves a
+        // dropped or superseded partial span cleanly instead of leaving stray text behind
+        // (the exact risk #245 flagged for naive interim injection). Preview-before-inject
+        // is honored because maybeInjectPartial() itself branches on that toggle first.
+        override fun onCloudLiveInterim(text: String) {
+            maybeInjectPartial(text)
+        }
+
         override fun deliverText(
             text: String,
             rawText: String?,
@@ -434,7 +447,42 @@ open class WhisperAccessibilityService : AccessibilityService() {
         override fun foregroundPackageName(): String? = currentForegroundPackageName()
     }
 
-    internal val runtime = DictationRuntime(this, runtimeListener)
+    // #245: the accessibility/floating-icon host now reaches the same merged cloud-live seam
+    // the IME host has used since #233 Phase 1 (RamblrImeService.kt). CloudLiveWiring.factoryOrNull
+    // returns null unless the user opted into Cloud Live, chose cloud transcription, and has a
+    // configured Gemini credential -- so this is a no-op, byte-for-byte-identical construction for
+    // every shipped/default configuration, exactly as it was for the IME host at merge time.
+    //
+    // Backed by an explicit nullable field and a get()-based accessor rather than an eager field
+    // initializer: an AccessibilityService's field initializers run during the framework's no-arg
+    // construction, before attachBaseContext() -- calling `this` as a Context that early
+    // (CloudLiveWiring.factoryOrNull reads SharedPreferences off it) would crash before the
+    // service ever reaches onServiceConnected(). Deferring construction to first access is safe
+    // because every real access (onTap()/callbacks, and onServiceConnected() itself) runs after
+    // the service is fully attached and connected -- the same safe timing RamblrImeService gets
+    // for free because ensureRuntime() is called from its own post-attach lifecycle methods.
+    //
+    // The DictationRuntime itself is still created lazily, once, and kept for the process
+    // lifetime of this long-lived accessibility service. But `cloudLiveFactory` is passed as a
+    // provider lambda (re-invoked on every dictation attempt), not a resolved value captured at
+    // this one-time construction -- otherwise toggling Cloud Live on/off, switching cloud/local
+    // transcription, or rotating the Gemini key while the service is already running would have
+    // no effect until the service process was killed and recreated, since nothing here ever
+    // rebuilds `runtimeInstance`. See DictationRuntime's `cloudLiveFactory` kdoc.
+    // Construction is @Synchronized because onServiceConnected() reaches `runtime` from two
+    // background threads (initLocalModel()/initStreamingModel()) while the main thread can touch
+    // it too. An unsynchronized check-then-assign would let two threads each build a
+    // DictationRuntime and silently orphan the loser -- never shut down by onDestroy(), which
+    // only sees whichever won the assignment, with native models already loading on both.
+    private var runtimeInstance: DictationRuntime? = null
+    internal val runtime: DictationRuntime
+        get() = obtainRuntime()
+
+    @Synchronized
+    private fun obtainRuntime(): DictationRuntime =
+        runtimeInstance ?: DictationRuntime(
+            this, runtimeListener, cloudLiveFactory = { CloudLiveWiring.factoryOrNull(this) }
+        ).also { runtimeInstance = it }
 
     private var overlayView: FrameLayout? = null
     private var button: ImageView? = null
@@ -707,18 +755,27 @@ open class WhisperAccessibilityService : AccessibilityService() {
         instance = null
         unregisterNetworkCallback()
         unregisterScreenStateReceiver()
-        // The runtime owns the recording/transcription teardown: state machine reset, reader
-        // teardown, stray session release, watchdog/guard/in-flight cancel, wakelock release,
-        // cleanup-model release, and streaming teardown -- in exactly the pre-extraction order
-        // (see [DictationRuntime.shutdown]).
-        runtime.shutdown()
+        // Only tear down a runtime that was actually constructed. `runtime`'s getter is lazy
+        // (see its kdoc above) -- if the service is destroyed before onServiceConnected ever ran
+        // (e.g. the framework unbinds it right after a failed/aborted bind), naively reading
+        // `runtime` here would construct a brand-new DictationRuntime for the sole purpose of
+        // immediately shutting it down: wasted work, and a DictationRuntime instance nobody
+        // needed that would itself need tearing down again. Guard on the backing field instead.
+        runtimeInstance?.let { runtime ->
+            // The runtime owns the recording/transcription teardown: state machine reset, reader
+            // teardown, stray session release, watchdog/guard/in-flight cancel, wakelock release,
+            // cleanup-model release, and streaming teardown -- in exactly the pre-extraction order
+            // (see [DictationRuntime.shutdown]).
+            runtime.shutdown()
+            // Release the native transcriber recognizers too (M7): like onTrimMemory, replace(null) can
+            // block on an in-flight transcription, so it runs off the main thread. Without this, a
+            // service destroy/recreate in the same process (accessibility toggle off/on) leaves the old
+            // instance's recognizers (batch model up to 465MB) resident alongside the new ones until
+            // process death.
+            runtime.releaseTranscribersAsync()
+        }
+        runtimeInstance = null
         flushPendingStreamingHandoff()
-        // Release the native transcriber recognizers too (M7): like onTrimMemory, replace(null) can
-        // block on an in-flight transcription, so it runs off the main thread. Without this, a
-        // service destroy/recreate in the same process (accessibility toggle off/on) leaves the old
-        // instance's recognizers (batch model up to 465MB) resident alongside the new ones until
-        // process death.
-        runtime.releaseTranscribersAsync()
         handler.removeCallbacks(expirePendingInjection)
         pendingInjection?.node?.recycle()
         pendingInjection = null
@@ -1209,7 +1266,22 @@ open class WhisperAccessibilityService : AccessibilityService() {
      * back off from outside this class.
      */
     internal fun applyOverlayVisibility() {
-        val visible = overlayShouldBeVisible(mainActivityForeground, IconHiddenState.isHidden(this), isKeyguardLocked(), overlayForceVisibleOverride)
+        // #256: only ever reads currentForegroundPackageName() at this same on-demand trigger
+        // point applyOverlayVisibility() already runs at (app foreground change, screen/keyguard
+        // events, hide-icon toggle, force-visible override) -- no new subscription or polling
+        // added. See ExclusionGating's doc for the honest limit this implies: the ring can lag a
+        // real foreground switch by however long until one of those existing triggers next fires.
+        val excludedForeground = ExclusionGating.ringHiddenForExclusion(
+            currentForegroundPackageName(),
+            PerAppExclusionStore.exclusions(this),
+        )
+        val visible = overlayShouldBeVisible(
+            mainActivityForeground,
+            IconHiddenState.isHidden(this),
+            isKeyguardLocked(),
+            overlayForceVisibleOverride,
+            excludedForeground,
+        )
         setOverlayTouchable(visible)
         // alpha, not View.GONE (Pixel Fold display-transition stall, root-caused via Opus + real
         // on-device logcat capture: this runs on the same SCREEN_ON/SCREEN_OFF/USER_PRESENT/
@@ -2146,6 +2218,18 @@ open class WhisperAccessibilityService : AccessibilityService() {
     // --- State machine ---
 
     private fun onTap() {
+        // #256: only blocks a NEW recording start (state == IDLE) -- stop/cancel of an
+        // already-running dictation must stay reachable regardless of exclusion, so this never
+        // touches RECORDING/TRANSCRIBING. On-demand read of currentForegroundPackageName(), same
+        // primitive already used elsewhere in this class -- no new subscription.
+        if (ExclusionGating.shouldBlockNewRecording(
+                runtime.currentState(),
+                PerAppExclusionStore.isExcluded(this, currentForegroundPackageName()),
+            )
+        ) {
+            toast("Ramblr is excluded in this app — see Settings > Behavior")
+            return
+        }
         runtime.onTap()
     }
 
@@ -2388,6 +2472,34 @@ open class WhisperAccessibilityService : AccessibilityService() {
         val streamingHandoff = streamingSession ?: pendingStreamingHandoff
         streamingSession = null
         pendingStreamingHandoff = null
+
+        // #256: final-insertion suppression. Read on demand, right here, at the moment injection
+        // is about to happen -- this is deliberately a *fresh* currentForegroundPackageName()
+        // read rather than whatever package was foreground when recording started, because the
+        // exclusion list's whole point is "text never lands in this app," and the user may have
+        // switched apps mid-dictation. No clipboard write and no node write happen on this path --
+        // clipboard is itself a hop the text could be manually pasted from into the excluded app,
+        // so it's suppressed too, not just the direct node injection. History recording above is
+        // unaffected: it's a local record of what was said, not a write into the excluded app.
+        if (ExclusionGating.shouldSuppressInsertion(
+                PerAppExclusionStore.isExcluded(this, currentForegroundPackageName())
+            )
+        ) {
+            Log.i(TAG, "Suppressing final insertion -- foreground app is on the exclusion list")
+            if (streamingHandoff != null) {
+                clearStreamingLeftover(streamingHandoff)
+                streamingHandoff.node.recycle()
+            }
+            updatePendingInjection(InjectMethod.NONE, text, rawText ?: text, null, null, null, historyTimestamp)
+            fallbackClipboardText = null
+            showFeedback(
+                "Ramblr is excluded in this app — nothing inserted or copied",
+                FALLBACK_FEEDBACK_DURATION_MS,
+                touchable = false,
+                isFallback = true,
+            )
+            return
+        }
 
         val priorClipboard = currentClipboardText()
         ClipboardUtil.copy(this, text)
