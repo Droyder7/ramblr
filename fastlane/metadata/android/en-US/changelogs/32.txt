@@ -1,0 +1,15 @@
+Corrected automation off-hook command, and overlay window hardening.
+
+- The command shown in Settings > Advanced > Behavior for MacroDroid/Tasker to turn
+  Ramblr off now targets your phone's exact user correctly. The previous version could
+  fail with a permission error for some callers even though the feature was enabled and
+  the phone had only one user. It also no longer says you need ADB or root -- an
+  ordinary automation command works.
+- If your automation tool shows a result code for that command, it now reflects what
+  actually happened: 0 means the feature is off, 1 means Ramblr's service was live and
+  was told to turn off, 2 means the feature is on but nothing was running to turn off.
+- Fixed a crash path where showing the floating overlay icon could partially fail and
+  leak a window instead of cleaning up after itself.
+
+Known issue: one user reports crashes when another app hands off to a banking app.
+That is not fixed here and is still being investigated.
